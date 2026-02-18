@@ -92,7 +92,7 @@ For a deep dive into how the calculations work and how the code is structured, c
 
 ---
 
-## The SmartPLS Cheat (Limitations)
+## Limitations
 
 Currently, Fornell-Larcker Criterion and Model Fit (SRMR, etc.) cannot be calculated directly by this script. 
 
