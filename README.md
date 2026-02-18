@@ -1,4 +1,11 @@
 # PLS-SEM With Python
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Built With](https://img.shields.io/badge/Built%20With-Streamlit-ff4b4b)
+![Method](https://img.shields.io/badge/Method-PLS--SEM-purple)
+![Alternative](https://img.shields.io/badge/Alternative%20To-SmartPLS-red)
+![Bootstrapping](https://img.shields.io/badge/Bootstrapping-5000%20Iterations-orange)
+
 
 > **WARNING:** All `.csv` files provided in this repository (like `dummy_data.csv`, `cross_loadings_dummy.csv`, etc.) are **dummy data** for demonstration purposes only. Do NOT use them for actual research or reference.
 
