@@ -1,0 +1,475 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plspm.config as c
+from plspm.plspm import Plspm
+from plspm.scheme import Scheme
+from plspm.mode import Mode
+from scipy.stats import t
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import time
+import logging
+import os
+import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Configuration Loading ---
+# Values are loaded from your .env file.
+DATA_PATH = os.getenv("DATA_PATH")
+DELIMITER = os.getenv("DELIMITER")
+CROSS_LOADINGS_CSV = os.getenv("CROSS_LOADINGS_CSV")
+FORNELL_LARCKER_CSV = os.getenv("FORNELL_LARCKER_CSV")
+MODEL_FIT_CSV = os.getenv("MODEL_FIT_CSV")
+PATH_RESULTS_CSV = os.getenv("PATH_RESULTS_CSV")
+
+# Validate that all required environment variables were loaded
+_REQUIRED_VARS = {
+    "DATA_PATH": DATA_PATH, "DELIMITER": DELIMITER, "CROSS_LOADINGS_CSV": CROSS_LOADINGS_CSV,
+    "FORNELL_LARCKER_CSV": FORNELL_LARCKER_CSV, "MODEL_FIT_CSV": MODEL_FIT_CSV,
+    "PATH_RESULTS_CSV": PATH_RESULTS_CSV,
+}
+_missing_vars = [key for key, value in _REQUIRED_VARS.items() if value is None]
+if _missing_vars:
+    st.error(f"FATAL: Missing required configuration in .env file: {', '.join(_missing_vars)}")
+    st.stop()
+
+def load_model_config():
+    try:
+        with open('model_config.yaml', 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        st.error("model_config.yaml not found. Please create it.")
+        return None
+    except Exception as e:
+        st.error(f"Error reading model_config.yaml: {e}")
+        return None
+
+MODEL_CONFIG = load_model_config()
+
+def get_logger(name):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+logger = get_logger(__name__)
+
+st.set_page_config(page_title="PLS-SEM Analysis Dashboard", layout="wide")
+
+st.markdown("""
+<style>
+    .main-header {font-size: 24px; font-weight: bold; color: #2c3e50; margin-bottom: 20px;}
+    .sub-header {font-size: 18px; font-weight: bold; color: #34495e; margin-top: 20px; border-bottom: 2px solid #ecf0f1; padding-bottom: 5px;}
+    .metric-card {background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 5px solid #2980b9; margin-bottom: 10px;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("PLS-SEM Analysis Dashboard")
+
+def get_optimal_processes(bootstrap_iterations):
+    n_cores = os.cpu_count() or 1
+    for i in range(n_cores, 0, -1):
+        if bootstrap_iterations % i == 0:
+            return i
+    return 1
+
+@st.cache_data
+def load_data():
+    try:
+        data = pd.read_csv(DATA_PATH, delimiter=DELIMITER)
+        data.columns = data.columns.str.strip()
+        return data
+    except FileNotFoundError:
+        st.error(f"Data file not found at: {DATA_PATH}. Please check your .env configuration.")
+        return None
+    except Exception as e:
+        st.error(f"Failed to load data: {e}")
+        return None
+
+def calculate_htmt(data, mv_map):
+    lvs = sorted(list(set(mv_map.values())))
+    htmt_matrix = pd.DataFrame(index=lvs, columns=lvs)
+    model_indicators = list(mv_map.keys())
+    corr_matrix = data[model_indicators].corr().abs()
+
+    for i in lvs:
+        for j in lvs:
+            if i == j:
+                htmt_matrix.loc[i, j] = 1.0
+                continue
+            indicators_i = [k for k, v in mv_map.items() if v == i]
+            indicators_j = [k for k, v in mv_map.items() if v == j]
+            r_ij = corr_matrix.loc[indicators_i, indicators_j].values.mean()
+            if len(indicators_i) > 1:
+                vals_i = corr_matrix.loc[indicators_i, indicators_i].values
+                r_ii = vals_i[~np.eye(vals_i.shape[0], dtype=bool)].mean()
+            else:
+                r_ii = 1.0
+            if len(indicators_j) > 1:
+                vals_j = corr_matrix.loc[indicators_j, indicators_j].values
+                r_jj = vals_j[~np.eye(vals_j.shape[0], dtype=bool)].mean()
+            else:
+                r_jj = 1.0
+            htmt_val = r_ij / np.sqrt(r_ii * r_jj)
+            htmt_matrix.loc[i, j] = htmt_val
+    htmt_matrix = htmt_matrix.apply(pd.to_numeric)
+    mask = np.triu(np.ones(htmt_matrix.shape), k=0).astype(bool)
+    htmt_matrix = htmt_matrix.where(~mask, np.nan)
+    return htmt_matrix
+
+def calculate_indicator_q2(data, scores, structure_paths, mv_map):
+    q2_results = []
+    endogenous_lvs = set([dst for _, dst in structure_paths])
+    
+    for lv in endogenous_lvs:
+        indicators = [k for k, v in mv_map.items() if v == lv]
+        predictors = [src for src, dst in structure_paths if dst == lv]
+        if not predictors: continue
+        X = scores[predictors].values
+        
+        for indicator in indicators:
+            y = data[indicator].values
+            kf = KFold(n_splits=7, shuffle=True, random_state=42)
+            sse, sso = 0, 0
+            
+            for train_index, test_index in kf.split(X):
+                X_train, X_test = X[train_index], X[test_index]
+                y_train, y_test = y[train_index], y[test_index]
+                model = LinearRegression().fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+                sse += np.sum((y_test - y_pred)**2)
+                sso += np.sum((y_test - np.mean(y_train))**2)
+                
+            q2_val = 1 - (sse / sso) if sso > 0 else 0
+            q2_results.append({'Variable': indicator, 'Q²': q2_val})
+            
+    return pd.DataFrame(q2_results)
+
+def calculate_indicator_vif(data, mv_map):
+    vif_results = []
+    lv_to_indicators = {}
+    for indicator, lv in mv_map.items():
+        if lv not in lv_to_indicators:
+            lv_to_indicators[lv] = []
+        lv_to_indicators[lv].append(indicator)
+
+    for lv, indicators in lv_to_indicators.items():
+        if len(indicators) > 1:
+            for i, indicator_name in enumerate(indicators):
+                y = data[indicator_name]
+                x_indicators = [ind for ind in indicators if ind != indicator_name]
+                X = data[x_indicators]
+                X = sm.add_constant(X)
+                
+                model = sm.OLS(y, X).fit()
+                r_squared = model.rsquared
+                
+                vif = 1 / (1 - r_squared) if r_squared < 1.0 else np.inf
+                vif_results.append({'Indicator': indicator_name, 'VIF': vif})
+    
+    return pd.DataFrame(vif_results)
+
+def build_config(data, model_config):
+    structure = c.Structure()
+    active_paths = model_config.get('structural_paths', [])
+    for src, dst in active_paths:
+        structure.add_path([src], [dst])
+    
+    conf = c.Config(structure.path(), scaled=True)
+    mv_map = {}
+    
+    measurement_model = model_config.get('measurement_model', {})
+    
+    for prefix in measurement_model.get('prefixes', []):
+        cols = [m for m in data.columns if m.startswith(prefix)]
+        if cols:
+            conf.add_lv(prefix, Mode.A, *[c.MV(m) for m in cols])
+            for m in cols: mv_map[m] = prefix
+            
+    for lv, mvs in measurement_model.get('explicit', {}).items():
+        cols = [m for m in mvs if m in data.columns]
+        if cols:
+            conf.add_lv(lv, Mode.A, *[c.MV(m) for m in cols])
+            for m in cols: mv_map[m] = lv
+            
+    return conf, mv_map
+
+@st.cache_data
+def run_analysis(df, model_config):
+    path_definitions = model_config.get('structural_paths', [])
+    main_config, mv_map = build_config(df, model_config)
+    
+    missing_cols = [col for col in mv_map.keys() if col not in df.columns]
+    if missing_cols:
+        st.error(f"The following columns defined in model_config.yaml were not found in the data: {', '.join(missing_cols)}")
+        st.stop()
+
+    bootstrap_iterations = 5000
+    processes = get_optimal_processes(bootstrap_iterations)
+    
+    plspm_calc = Plspm(df, main_config, Scheme.PATH, iterations=300, tolerance=1e-7, bootstrap=True, bootstrap_iterations=bootstrap_iterations, processes=processes)
+    
+    boot_results = plspm_calc.bootstrap()
+    scores = plspm_calc.scores()
+    inner_sum = plspm_calc.inner_summary()
+    unidim = plspm_calc.unidimensionality()
+
+    loadings = plspm_calc.outer_model()
+    loadings['Variable'] = loadings.index.map(mv_map)
+
+    htmt_matrix = calculate_htmt(df, mv_map)
+    
+    boot_paths = boot_results.paths().reset_index().rename(columns={'index': 'Path'})
+    
+    std_cols = [col for col in boot_paths.columns if 'std' in col.lower() or 'error' in col.lower()]
+    boot_paths.rename(columns={std_cols[0]: 'Standard Deviation'}, inplace=True, errors='ignore')
+    
+    orig_col = 'original' if 'original' in boot_paths.columns else boot_paths.columns[1]
+    boot_paths.rename(columns={orig_col: 'Original Sample (O)'}, inplace=True)
+    
+    if 't stat.' not in boot_paths.columns:
+         boot_paths['t stat.'] = (boot_paths['Original Sample (O)'] / boot_paths['Standard Deviation']).fillna(0)
+    
+    boot_paths['P-Values'] = 2 * (1 - t.cdf(boot_paths['t stat.'].abs(), df=bootstrap_iterations - 1))
+    boot_paths['Keputusan'] = np.where((boot_paths['P-Values'] < 0.05) & (boot_paths['t stat.'].abs() > 1.96), "DITERIMA", "DITOLAK")
+
+    lvs_to_flip = []
+    all_lvs = sorted(list(set(mv_map.values())))
+    for lv in all_lvs:
+        lv_loads = loadings[loadings['Variable'] == lv]['loading']
+        if lv_loads.mean() < 0:
+            lvs_to_flip.append(lv)
+    
+    if lvs_to_flip:
+        for lv in lvs_to_flip:
+            loadings.loc[loadings['Variable'] == lv, 'loading'] *= -1
+            scores[lv] *= -1
+
+        for idx, row in boot_paths.iterrows():
+            path_str = row['Path']
+            if "->" in path_str:
+                src, dst = path_str.split(" -> ")
+                multiplier = 1
+                if src in lvs_to_flip: multiplier *= -1
+                if dst in lvs_to_flip: multiplier *= -1
+                
+                if multiplier != 1:
+                    boot_paths.at[idx, 'Original Sample (O)'] *= multiplier
+                    boot_paths.at[idx, 't stat.'] *= multiplier
+
+    f2_values = []
+    orig_r2 = inner_sum['r_squared']
+    for src, dst in path_definitions:
+        temp_paths = [p for p in path_definitions if p != (src, dst)]
+        
+        temp_model_config = model_config.copy()
+        temp_model_config['structural_paths'] = temp_paths
+        temp_config, temp_mv_map = build_config(df, temp_model_config)
+
+        if not temp_mv_map: continue
+        temp_calc = Plspm(df, temp_config, Scheme.PATH, iterations=100, bootstrap=False)
+        r2_incl = orig_r2.get(dst, 0)
+        r2_excl = temp_calc.inner_summary()['r_squared'].get(dst, 0)
+        f2 = (r2_incl - r2_excl) / (1 - r2_incl) if (1 - r2_incl) != 0 else 0
+        f2_values.append({'Path': f"{src} -> {dst}", 'f2': abs(f2)})
+        
+    final_results = pd.merge(boot_paths, pd.DataFrame(f2_values), on='Path', how='left')
+    if 't stat.' in final_results.columns:
+        final_results['t stat.'] = final_results['t stat.'].abs()
+
+    hipotesis_map = model_config.get('hypothesis_labels', {})
+    
+    final_results['Hipotesis'] = final_results['Path'].map(hipotesis_map)
+    final_results.rename(columns={'Path': 'Hubungan'}, inplace=True)
+    
+    if 'Hipotesis' in final_results.columns and not final_results['Hipotesis'].isnull().all():
+        final_results['H_num'] = final_results['Hipotesis'].str.extract(r'(\d+)').astype(float)
+        final_results = final_results.sort_values('H_num').drop(columns=['H_num'])
+
+    cols = ['Hipotesis', 'Hubungan'] + [col for col in final_results.columns if col not in ['Hipotesis', 'Hubungan']]
+    final_results = final_results[cols]
+    
+    final_results.to_csv(PATH_RESULTS_CSV, index=False)
+
+    indicator_vif_df = calculate_indicator_vif(df, mv_map)
+    indicator_q2_df = calculate_indicator_q2(df, scores, path_definitions, mv_map)
+    
+    return {
+        "final_results": final_results,
+        "unidim": unidim,
+        "inner_sum": inner_sum,
+        "loadings": loadings,
+        "mv_map": mv_map,
+        "htmt_matrix": htmt_matrix,
+        "indicator_vif_df": indicator_vif_df,
+        "indicator_q2_df": indicator_q2_df,
+        "scores": scores,
+    }
+
+def run_analysis_with_progress(df, model_config):
+    progress_bar = st.progress(0)
+    st.info("Starting PLS-SEM analysis...")
+    logger.info("Starting PLS-SEM analysis...")
+
+    results = run_analysis(df, model_config)
+
+    progress_bar.progress(33)
+    st.info("Calculating additional metrics (HTMT, f-squared)...")
+    logger.info("Calculating additional metrics...")
+    
+    progress_bar.progress(66)
+    st.info("Finalizing results...")
+    logger.info("Finalizing results...")
+    
+    progress_bar.progress(100)
+    st.success("Analysis Complete!")
+    logger.info("Analysis Complete!")
+
+    return results
+
+def main():
+    if not MODEL_CONFIG:
+        st.stop()
+        
+    df = load_data()
+    if df is None:
+        st.stop()
+
+    if st.button("Rerun Analysis & Clear Cache"):
+        st.cache_data.clear()
+        st.success("Cache has been cleared. Rerunning analysis...")
+        time.sleep(1) 
+        st.experimental_rerun()
+
+    try:
+        results = run_analysis_with_progress(df, MODEL_CONFIG)
+        
+        final_results = results["final_results"]
+        unidim = results["unidim"]
+        inner_sum = results["inner_sum"]
+        loadings = results["loadings"]
+        mv_map = results["mv_map"]
+        htmt_matrix = results["htmt_matrix"]
+        indicator_vif_df = results["indicator_vif_df"]
+        indicator_q2_df = results["indicator_q2_df"]
+        scores = results["scores"]
+        
+        tab1, tab2, tab3 = st.tabs(["1. Measurement Model (Outer Model)", "2. Structural Model (Inner Model)", "3. Hypothesis Testing"])
+
+        with tab1:
+            st.markdown("### Convergent Validity & Reliability")
+            rel = pd.concat([unidim[['cronbach_alpha', 'dillon_goldstein_rho']], inner_sum['ave']], axis=1)
+            rel.columns = ["Cronbach's Alpha", "Composite Reliability", "AVE"]
+            st.dataframe(rel.round(3).style.format("{:.3f}"))
+
+            st.markdown("### Outer Loadings")
+            outer_loadings_pivoted = loadings.pivot_table(index=loadings.index, columns='Variable', values='loading')
+            all_lvs = sorted(list(set(mv_map.values())))
+            all_indicators = sorted(list(mv_map.keys()))
+            outer_loadings_pivoted = outer_loadings_pivoted.reindex(index=all_indicators, columns=all_lvs)
+
+            def style_primary_loading(val):
+                if pd.isna(val): return ''
+                return 'background-color: yellow; color: black;' if val >= 0.708 else 'background-color: red; color: black;'
+            st.dataframe(outer_loadings_pivoted.round(3).style.applymap(style_primary_loading).format("{:.3f}", na_rep=""), use_container_width=True)
+
+            st.markdown("### Discriminant Validity (Cross-Loadings)")
+            all_data_for_corr = pd.concat([df[all_indicators], scores], axis=1)
+            correlations = all_data_for_corr.corr().loc[all_indicators, all_lvs]
+            correlations.to_csv(CROSS_LOADINGS_CSV)
+
+            def style_crossloadings(row):
+                lv_of_indicator = mv_map.get(row.name)
+                styles = [''] * len(row)
+                if lv_of_indicator and lv_of_indicator in row.index:
+                    primary_loading_val = row[lv_of_indicator]
+                    max_loading_in_row = row.abs().max()
+                    if abs(primary_loading_val) >= max_loading_in_row - 1e-9:
+                        lv_col_idx = row.index.get_loc(lv_of_indicator)
+                        styles[lv_col_idx] = 'background-color: yellow; color: black;'
+                return styles
+            st.dataframe(correlations.round(3).style.apply(style_crossloadings, axis=1).format("{:.3f}"), use_container_width=True)
+
+            st.markdown("### Discriminant Validity (Fornell-Larcker Criterion)")
+            try:
+                fornell_larcker_df = pd.read_csv(FORNELL_LARCKER_CSV, index_col=0)
+                def style_fornell_larcker(df):
+                    styled_df = pd.DataFrame('', index=df.index, columns=df.columns)
+                    for i, r in df.iterrows():
+                        for j, v in r.items():
+                            if pd.notna(v):
+                                if i == j: 
+                                    styled_df.loc[i, j] = 'background-color: yellow; color: black; font-weight: bold;'
+                                else:
+                                    if abs(v) > df.loc[j, j]:
+                                        styled_df.loc[i, j] = 'background-color: #f8d7da; color: black;'
+                    return styled_df
+                st.dataframe(fornell_larcker_df.style.apply(style_fornell_larcker, axis=None).format("{:.3f}", na_rep=""), use_container_width=True)
+            except FileNotFoundError:
+                st.warning(f"{FORNELL_LARCKER_CSV} file not found.")
+
+            st.markdown("### Discriminant Validity (HTMT Ratio)")
+            st.dataframe(htmt_matrix.round(3).style.background_gradient(cmap='Reds', vmin=0.85, vmax=1.0).format("{:.3f}", na_rep=""), use_container_width=True)
+
+        with tab2:
+            st.markdown("### Model Fit Results")
+            try:
+                model_fit_df = pd.read_csv(MODEL_FIT_CSV)
+                model_fit_df.columns = ['Model Fit Criteria', 'Threshold', 'Saturated model', 'Estimated model', 'Description']
+                model_fit_df = model_fit_df.set_index('Model Fit Criteria')
+                st.dataframe(model_fit_df)
+            except FileNotFoundError:
+                st.warning(f"{MODEL_FIT_CSV} file not found.")
+        
+            st.markdown("### Prediction Quality (R-Square)")
+            r_squared_df = inner_sum['r_squared'].reset_index()
+            r_squared_df.columns = ['Dependent Variable', 'R^2']
+            r_squared_df = r_squared_df[r_squared_df['R^2'] > 0.001]
+            
+            def get_r2_keterangan(r2):
+                if r2 >= 0.75: return "Tinggi"
+                elif r2 >= 0.50: return "Moderat"
+                elif r2 >= 0.25: return "Lemah"
+                return "Sangat Lemah"
+            
+            r_squared_df['Description'] = r_squared_df['R^2'].apply(get_r2_keterangan)
+            st.dataframe(r_squared_df.round(3).set_index('Dependent Variable').style.format({'R^2': '{:.3f}'}))
+            
+            st.markdown("### Prediction Quality (Q-Square)")
+            st.dataframe(indicator_q2_df.round(3).set_index('Variable').style.format("{:.3f}"))
+            
+            st.markdown("### Collinearity Between Indicators (VIF)")
+            st.dataframe(indicator_vif_df.round(3).set_index('Indicator').style.format("{:.3f}"))
+
+        with tab3:
+            st.markdown("### Pengujian Hipotesis")
+            cols_candidate = ['Hipotesis', 'Hubungan', 'Original Sample (O)', 'Standard Deviation', 't stat.', 'P-Values', 'Keputusan', 'f2']
+            cols_to_show = [c for c in final_results.columns if c in cols_candidate]
+            
+            def color_res(val):
+                background = "#d4edda" if val == "DITERIMA" else "#f8d7da"
+                return f'background-color: {background}; color: black;'
+            st.dataframe(final_results[cols_to_show].round(3).style.applymap(color_res, subset=['Keputusan']).format({
+                'Original Sample (O)': '{:.3f}', 'Standard Deviation': '{:.3f}', 
+                't stat.': '{:.3f}', 'P-Values': '{:.3f}', 'f2': '{:.3f}'
+            }, na_rep="-"), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"A system error occurred: {e}")
+        st.exception(e)
+
+if __name__ == "__main__":
+    if MODEL_CONFIG:
+        main()
+    else:
+        st.stop()

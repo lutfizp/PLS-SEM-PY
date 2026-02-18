@@ -1,0 +1,11 @@
+# Environment variables
+.env
+/redacted
+\redacted
+# Data files (if you don't want to share your data)
+#*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

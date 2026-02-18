@@ -1,0 +1,52 @@
+# Model PLS-SEM Configuration 
+# This file is used to define your model structure.
+
+# 1. Measurement Model
+# 'prefixes': If your indicators follow a naming pattern (e.g., F01_1, F01_2 for F01),
+#             just write the latent variable name here.
+# 'explicit': If your indicators have unique or non-sequential names,
+#             write them explicitly here.
+measurement_model:
+  prefixes:
+    - F01
+    - F02
+    - F03
+    - F04
+    - F05
+    - F06
+    - F07
+    - F09
+    - F10
+  explicit:
+    F08: [F08_1, F08_2, F08_3, F08_4]
+
+# 2. Structural Model
+# Define the hypotheses or path relationships between latent variables.
+# Format: [predictor_variable, outcome_variable]
+structural_paths:
+  - [F01, F09]
+  - [F02, F09]
+  - [F03, F09]
+  - [F04, F09]
+  - [F05, F09]
+  - [F06, F09]
+  - [F08, F09]
+  - [F07, F09]
+  - [F04, F10]
+  - [F08, F10]
+  - [F09, F10]
+
+# 3. Hypothesis Labels
+# (Optional) Name each path to make the results table look cleaner.
+hypothesis_labels:
+  "F07 -> F09": "H1"
+  "F04 -> F10": "H2"
+  "F08 -> F10": "H3"
+  "F09 -> F10": "H4"
+  "F01 -> F09": "H5"
+  "F02 -> F09": "H6"
+  "F03 -> F09": "H7"
+  "F04 -> F09": "H8"
+  "F05 -> F09": "H9"
+  "F06 -> F09": "H10"
+  "F08 -> F09": "H11"

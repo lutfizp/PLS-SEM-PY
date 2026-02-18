@@ -1,0 +1,6 @@
+"Model Fit Criteria","Threshold","Saturated model","Estimated model","Description"
+"SRMR","< 0.08",0.045,0.065,"Standardized Root Mean Square Residual"
+"d_ULS","< 2",0.78,1.23,"Unweighted Least Squares"
+"d_G","< 1",0.55,0.89,"Geodesic Distance"
+"Chi-Square","> 0.05",345.67,412.33,"Chi-Square Test"
+"NFI","> 0.90",0.92,0.91,"Normed Fit Index"
